@@ -5,9 +5,11 @@
 # Salesforce cache
 .sf/
 .sfdx/
+.husky/
+.vscode/
 .localdevserver/
 deploy-options.json
-
+hardis-report/
 # LWC VSCode autocomplete
 **/lwc/jsconfig.json
 
@@ -23,9 +25,6 @@ yarn-error.log*
 
 # Dependency directories
 node_modules/
-
-# ApexPMD cache
-.pmdCache
 
 # Eslint cache
 .eslintcache
@@ -46,3 +45,45 @@ $RECYCLE.BIN/
 **/__pycache__/
 **/.venv/
 **/venv/
+
+.illuminatedCloud/
+.idea/
+manifest/
+.sf/
+.sfdx/
+.vscode/
+.localdevserver/
+hardis-report/
+node_modules/
+config/
+
+
+#Exclude metadata that changes in each org.
+**/certs/*.crt
+**/installedpackages/*
+**/remoteSiteSettings/*
+**/namedCredentials/*
+**/authproviders/*
+**/emailservices/*
+**/profilePasswordPolicies/*
+**/profileSessionSettings/*
+**/connectedApps/*
+**/sites/*
+**/siteDotComSites/*
+
+
+#Exclude the metadata from the managed package
+**/classes/*__*
+**/triggers/*__*
+**/pages/*__*
+**/staticresources/*__*
+**/workflows/*__*__c.workflow-meta.xml
+**/customPermissions/*__*
+**/components/*__*
+**/weblinks/*__*
+**/fields/*__*__c.field-meta.xml
+**/activationPlatforms/*__*.activationPlatform-meta.xml
+**/applications/*__*.app-meta.xml
+**/featureParameters/*__*-meta.xml
+**/fieldSrcTrgtRelationships/*__*.fieldSrcTrgtRelationship-meta.xml
+**/objectTranslations/

@@ -1,0 +1,255 @@
+name: Move Sprint Items
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run at the end of each sprint (every 2 weeks on Monday at 6 AM)
+    - cron: "0 6 * * 1"
+
+jobs:
+  move-items:
+    env:
+      GITHUB_TOKEN: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      repository-projects: write
+
+    steps:
+      - name: Move sprint items
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const projectNumber = 243;
+            const iterationField = 'SF Sprint';
+            const iterationType =  'last';
+            const newIterationType = 'current';
+
+            console.log(`Looking for project #${projectNumber} in organization: ${owner}`);
+            const queryString = `query Organization{
+                organization(login:"${owner}") {
+                  projectV2(number: ${projectNumber}) {
+                    id
+                    title
+                    fields(first: 20) {
+                      nodes {
+                        ... on ProjectV2IterationField {
+                          id
+                          name
+                          configuration {
+                            iterations {
+                              startDate
+                              id
+                              title
+                            }
+                            completedIterations {
+                              startDate
+                              id
+                              title
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }`;
+            const response = await fetch("https://api.github.com/graphql", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": `Bearer ${process.env.GITHUB_TOKEN}`,
+                },
+                body: JSON.stringify({
+                    query: queryString,
+                }),
+                });
+
+                const data = await response.json();
+
+
+            const project = data.data.organization.projectV2;
+
+            // Fetch all items with pagination
+            let allItems = [];
+            let hasNextPage = true;
+            let cursor = "";
+
+            console.log('Fetching all project items...');
+
+            while (hasNextPage) {
+              const itemsQueryString = `query {
+                  organization(login: "${owner}") {
+                    projectV2(number: ${projectNumber}) {
+                      items(first: 100, after: "${cursor}") {
+                        pageInfo {
+                          hasNextPage
+                          endCursor
+                        }
+                        nodes {
+                          id
+                          fieldValues(first: 20) {
+                            nodes {
+                              ... on ProjectV2ItemFieldIterationValue {
+                                iterationId
+                                title
+                                field {
+                                  ... on ProjectV2IterationField {
+                                    id
+                                    name
+                                  }
+                                }
+                              }
+                              ... on ProjectV2ItemFieldSingleSelectValue {
+                                name
+                                field {
+                                  ... on ProjectV2SingleSelectField {
+                                    id
+                                    name
+                                  }
+                                }
+                              }
+                            }
+                          }
+                          content {
+                            ... on Issue {
+                              number
+                              title
+                            }
+                            ... on PullRequest {
+                              number
+                              title
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }`;
+                const itemsResponse = await fetch("https://api.github.com/graphql", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${process.env.GITHUB_TOKEN}`,
+                    },
+                    body: JSON.stringify({
+                        query: itemsQueryString,
+                    }),
+                });
+                const itemsData = await itemsResponse.json();
+
+                const pageData = itemsData.data.organization.projectV2.items;
+                allItems = allItems.concat(pageData.nodes);
+                hasNextPage = pageData.pageInfo.hasNextPage;
+                cursor = String(pageData.pageInfo.endCursor);
+                
+                console.log(`Fetched ${allItems.length} items so far...`);
+            }
+
+            // Add items to project object
+            project.items = { nodes: allItems };
+            console.log(`Project: ${project.title}`);
+
+            // Find the iteration field
+            const iterationFieldData = project.fields.nodes.find(
+              field => field.name === iterationField
+            );
+
+            if (!iterationFieldData) {
+              core.setFailed(`No iteration field found with name ${iterationField}`);
+              return;
+            }
+
+            console.log(`Found iteration field: ${iterationFieldData.name}`);
+
+            const lastIteration = iterationFieldData.configuration.completedIterations[0];
+            const currentIteration = iterationFieldData.configuration.iterations[0];
+            const nextIteration = iterationFieldData.configuration.iterations[1];
+
+            console.log(`Last iteration: ${lastIteration?.title || 'None'}`);
+            console.log(`Current iteration: ${currentIteration?.title || 'None'}`);
+            console.log(`Next iteration: ${nextIteration?.title || 'None'}`);
+
+            // Select source iteration based on input
+            const sourceIteration = iterationType === "last" ? lastIteration : currentIteration;
+
+            if (!sourceIteration) {
+              core.setFailed(`No ${iterationType} iteration found. Check if the iteration exists.`);
+              return;
+            }
+
+            console.log(`Source iteration (${iterationType}): ${sourceIteration.title}`);
+
+            // Select target iteration based on input
+            const targetIteration = newIterationType === "current" ? currentIteration : nextIteration;
+
+            if (!targetIteration) {
+              core.setFailed(`No ${newIterationType} iteration found. Check if the iteration exists.`);
+              return;
+            }
+
+            console.log(`Target iteration (${newIterationType}): ${targetIteration.title}`);
+
+            const excludedStatuses = ['👏 Done', '❌ Cancelled'];
+
+            console.log(`Total items in project: ${allItems.length}`);
+
+            // Filter items to move
+            const itemsToMove = project.items.nodes.filter(item => {
+              const iterationValue = item.fieldValues.nodes.find(
+                fv => fv.field?.name === iterationField
+              );
+              
+              const statusValue = item.fieldValues.nodes.find(
+                fv => fv.field?.name === 'Status'
+              );
+
+              const isInSourceSprint = iterationValue?.title === sourceIteration?.title;
+              const isExcludedStatus = excludedStatuses.includes(statusValue?.name);
+
+              return isInSourceSprint && !isExcludedStatus;
+            });
+
+            console.log(`Found ${itemsToMove.length} items to move from "${sourceIteration.title}" to "${targetIteration.title}"`);
+
+            // Move items to target iteration
+            for (const item of itemsToMove) {
+              try {
+
+                const mutationQuery = `mutation UpdateProjectV2ItemFieldValue{
+                  updateProjectV2ItemFieldValue(
+                    input: {
+                      projectId: "${project.id}"
+                      itemId: "${item.id}"
+                      fieldId: "${iterationFieldData.id}"
+                      value: { iterationId: "${targetIteration.id}" }
+                    }) 
+                    {
+                      projectV2Item {
+                        id
+                      }
+                    }
+                }`;
+                const updateResponse = await fetch("https://api.github.com/graphql", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${process.env.GITHUB_TOKEN}`,
+                    },
+                    body: JSON.stringify({
+                        query: mutationQuery,
+                    }),
+                });
+                const data = await updateResponse.json();
+                const issueNumber = item.content?.number || 'Unknown';
+                const issueTitle = item.content?.title || 'Unknown';
+                console.log(`✓ Moved #${issueNumber}: ${issueTitle}`);
+              } catch (error) {
+                console.error(`✗ Failed to move item:`, error.message);
+              }
+            }
+
+            console.log('Migration completed!');

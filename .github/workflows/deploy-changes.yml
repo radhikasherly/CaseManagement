@@ -1,0 +1,328 @@
+name: Deploy Changes After Merge
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+      - uat
+
+    paths:
+      - 'force-app/**'
+
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: check if PR is merged
+        if: github.event.pull_request.merged == false
+        run: |
+          echo "PR is not merged. Exiting deployment workflow."
+          echo "$GITHUB_REF_NAME"
+          echo "$GITHUB_REF"
+          # check if the $GITHUB_REF name ends with /merge
+          if [[ "$GITHUB_REF" == */merge ]]; then
+            echo "Inside If"
+            exit 1
+          else
+            echo "Inside Else"
+          fi
+          echo "outside if"
+          exit 1
+      
+      - name: Mark repo directory as safe
+        run: |
+          git config --global --add safe.directory /__w/sf-pipeline-test/sf-pipeline-test
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for diff
+          persist-credentials: false
+      
+      - name : Configure Git
+        run : |
+          git config --global user.email "sai.dinakaran@infinitaslearning.com"
+          git config --global user.name "Sai Dinakaran"
+          git remote set-url origin https://${{secrets.PERSONAL_ACCESS_TOKEN}}@github.com/${{ github.repository }}.git
+      
+      - name: check latest commit is merge commit
+        id: check-merge-commit
+        run: |
+          feature_branch="${{ github.head_ref }}"
+          if git log "origin/$feature_branch" -1 --pretty=%B | grep -q "Merge branch "; then
+            echo "is-merge-resolved=true" >> $GITHUB_OUTPUT 
+          else
+            echo "Latest commit is not a merge commit"
+          fi
+
+      - name: Get Commit id for feature (before merge commit)
+        if: steps.check-merge-commit.outputs.is-merge-resolved == 'true'
+        id: get-feature-commit
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const { data: commits } = await github.rest.pulls.listCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number
+            });
+            
+            console.log(`Total commits in PR: ${commits.length}`);
+            
+            if (commits.length < 2) {
+              console.log("PR has less than 2 commits, using the only commit");
+              return;
+            }
+            
+            // Get second to last commit (before merge commit)
+            const featureCommit = commits[commits.length - 2].sha;
+            console.log(`Second to last commit: ${featureCommit}`);
+            console.log(`Commit message: ${commits[commits.length - 2].commit.message}`);
+            
+            core.setOutput('latest-feature-commit', featureCommit);
+ 
+
+      - name: Get PR commits and merge-base
+        if: github.ref_name == 'main'
+        id: get-pr-info
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            
+            // Get the head SHA (last commit on feature branch before merge)
+            const headSha = pr.head.sha;
+            const baseSha = pr.base.sha;
+            
+            console.log(`PR Head SHA (feature branch): ${headSha}`);
+            console.log(`PR Base SHA (target branch): ${baseSha}`);
+            
+            core.setOutput('head-sha', headSha);
+            core.setOutput('base-sha', baseSha);
+            
+            // Get all commits in the PR
+            const { data: commits } = await github.rest.pulls.listCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number
+            });
+            
+            console.log(`Total commits in PR: ${commits.length}`);
+            
+            // Get the last commit from the feature branch (before any merge commit)
+            const lastFeatureCommit = commits[commits.length - 1].sha;
+            console.log(`Last feature commit: ${lastFeatureCommit}`);
+            console.log(`Commit message: ${commits[commits.length - 1].commit.message}`);
+            
+            core.setOutput('last-feature-commit', lastFeatureCommit); 
+      
+      - name: Fetch base and head branches
+        run: |
+          git fetch origin main
+          git fetch --all
+          git fetch origin ${{ github.head_ref }}
+      
+      - name: Extract feature branch name from merge commit
+        id: extract-branch
+        run: |
+          # Get the commit message of the latest commit
+          COMMIT_MESSAGE=$(git log -1 --pretty=format:"%s")
+          echo "Latest commit message: $COMMIT_MESSAGE"
+          
+          # Check if this is a merge commit from a PR
+          if [[ "$COMMIT_MESSAGE" =~ ^Merge\ pull\ request\ #[0-9]+\ from\ .*/(.+)$ ]]; then
+            FEATURE_BRANCH="${BASH_REMATCH[1]}"
+            echo "Feature branch detected: $FEATURE_BRANCH"
+            echo "feature-branch=$FEATURE_BRANCH" >> $GITHUB_OUTPUT
+            echo "is-merge-commit=true" >> $GITHUB_OUTPUT
+          else
+            # Try alternative merge commit format: "Merge branch 'feature-branch' into target-branch"
+            if [[ "$COMMIT_MESSAGE" =~ ^Merge\ branch\ \'([^\']+)\'\ into\ .+$ ]]; then
+              FEATURE_BRANCH="${BASH_REMATCH[1]}"
+              echo "Feature branch detected (alternative format): $FEATURE_BRANCH"
+              echo "feature-branch=$FEATURE_BRANCH" >> $GITHUB_OUTPUT
+              echo "is-merge-commit=true" >> $GITHUB_OUTPUT
+            else
+              echo "Not a merge commit or unable to extract feature branch"
+              echo "feature-branch=unknown" >> $GITHUB_OUTPUT
+              echo "is-merge-commit=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+      
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install SFDX and plugins
+        run: |
+          npm install --no-cache @salesforce/cli --global
+          sf plugins install @salesforce/plugin-packaging
+          echo 'y' | sf plugins install sfdx-git-delta
+      
+      - name: Compute changed files
+        id: changed-files
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            # Use the PR head SHA (from before merge) and base SHA
+            HEAD_SHA="${{ steps.get-pr-info.outputs.head-sha }}"
+            BASE_SHA="${{ steps.get-pr-info.outputs.base-sha }}"
+            
+            echo "Computing merge-base for PR"
+            echo "Head SHA (feature branch): $HEAD_SHA"
+            echo "Base SHA (target branch): $BASE_SHA"
+            
+            # Get the merge-base between the two branches before the merge
+            MERGE_BASE=$(git merge-base $BASE_SHA $HEAD_SHA)
+            echo "Merge Base: $MERGE_BASE"
+            if [[ "${{ steps.check-merge-commit.outputs.is-merge-resolved }}" == "true" ]]; then
+              TARGET_COMMIT="${{ steps.get-pr-info.outputs.last-feature-commit }}"
+            else
+              TARGET_COMMIT="$HEAD_SHA"
+            fi
+            # Use the last feature commit for delta calculation
+            
+            echo "Target Commit (last feature commit): $TARGET_COMMIT"
+            
+            # Calculate delta from merge-base to last feature commit
+            sf sgd source delta -f $MERGE_BASE -t $TARGET_COMMIT --output-dir .
+          else
+            if [[ -n "${{ steps.get-feature-commit.outputs.latest-feature-commit }}" ]]; then
+              BASE_COMMIT=$(git merge-base origin/main ${{ steps.get-feature-commit.outputs.latest-feature-commit }})
+              echo "Base commit: $BASE_COMMIT"
+              sf sgd source delta -f $BASE_COMMIT -t ${{ steps.get-feature-commit.outputs.latest-feature-commit }} --output-dir .
+            else
+                BASE_COMMIT=$(git merge-base origin/main origin/${{ github.head_ref }})
+                echo "Base commit: $BASE_COMMIT"
+                sf sgd source delta -f $BASE_COMMIT -t origin/${{ github.head_ref }} --output-dir .
+            fi
+          fi
+
+          
+
+          cat package/package.xml
+          cat destructiveChanges/destructiveChanges.xml
+
+
+      - name: Check test_classes.txt content
+        id: check-test-classes
+        run: |
+          if [ -s "test_classes.txt" ]; then
+            echo "test_classes.txt has content:"
+            cat test_classes.txt
+            echo "has-test-classes=true" >> $GITHUB_OUTPUT
+            
+            # Read test classes and format them for SF CLI
+            TEST_CLASSES=$(cat test_classes.txt | tr '\n' ' --tests ' | sed 's/,$//')
+            TEST_CLASSES=$(echo "$TEST_CLASSES" | perl -pe 's/[\x00-\x1F\x7F\xA0]//g')
+            echo "Clean String:"
+            echo "$TEST_CLASSES" | cat -v
+            CLASS_ARGS=""
+            for cls in $TEST_CLASSES; do
+              CLASS_ARGS="$CLASS_ARGS --tests $cls"
+            done
+
+            echo "$CLASS_ARGS"
+
+            echo "test-classes=$CLASS_ARGS" >> $GITHUB_OUTPUT
+            echo "Formatted test classes: $CLASS_ARGS"
+          else
+            echo "test_classes.txt is empty or does not exist"
+            echo "has-test-classes=false" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Set Destination Org and login to org
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == "uat" ]]; then
+            echo ${{ secrets.SFDX_AUTH_URL_UAT}} > ./SFDX_URL_STORE.txt
+            echo "UAT Login is Selected"
+          elif [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            echo ${{ secrets.SFDX_AUTH_URL_PROD}} > ./SFDX_URL_STORE.txt
+            echo "Production Login is Selected"
+          else
+            echo "Invalid branch: ${GITHUB_REF_NAME}" 
+            exit 1
+          fi
+          sf org login sfdx-url --sfdx-url-file=./SFDX_URL_STORE.txt -s
+
+      - name: Deploy to Org
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            echo "Production Deployment, Running all local tests"
+            sf project deploy start -x package/package.xml --post-destructive-changes destructiveChanges/destructiveChanges.xml -l RunLocalTests --coverage-formatters text
+            echo "Code Coverage Report:"
+            cat coverage/coverage/text.txt
+          else
+            # For non-production deployments, use specific test classes if available
+            if [[ "${{ steps.check-test-classes.outputs.has-test-classes }}" == "true" ]]; then
+              echo "Running deployment with specific test classes: ${{ steps.check-test-classes.outputs.test-classes }}"
+              sf project deploy start -x package/package.xml --post-destructive-changes destructiveChanges/destructiveChanges.xml -l RunSpecifiedTests ${{ steps.check-test-classes.outputs.test-classes }} --coverage-formatters text
+              echo "Code Coverage Report:"
+              cat coverage/coverage/text.txt
+            else
+              echo "No specific test classes found, running without specific tests"
+              sf project deploy start -x package/package.xml --post-destructive-changes destructiveChanges/destructiveChanges.xml
+            fi
+          fi
+      
+      - name: Clear test_classes.txt 
+        run: |
+          echo "Clearing test_classes.txt file after successful deployment"
+          
+          # Clear the test_classes.txt file
+          > test_classes.txt
+          
+          # Check if there are changes to commit
+          if git diff --quiet test_classes.txt; then
+            echo "No changes to commit - test_classes.txt is already empty"
+          else
+            echo "Committing cleared test_classes.txt file"
+            git add test_classes.txt
+            git commit -m "Clear test_classes.txt after successful deployment [skip ci]"
+            git remote -v
+            # Push using your personal access token
+            echo "Pushing changes to ${GITHUB_REF_NAME} as ${{ github.actor }}"
+            git push https://x-access-token:${{ secrets.PERSONAL_ACCESS_TOKEN }}@github.com/${{ github.repository }}.git HEAD:${GITHUB_REF_NAME}
+          fi
+
+      - name: Deployment Success Notification
+        if: success() && steps.changed-files.outputs.has-changes == 'true'
+        run: |
+          echo "=== Deployment Successful ==="
+          echo "Environment: $TARGET_ENV"
+          echo "Branch: ${GITHUB_REF_NAME}"
+          echo "Feature Branch: ${{ steps.extract-branch.outputs.feature-branch }}"
+          echo "Is Merge Commit: ${{ steps.extract-branch.outputs.is-merge-commit }}"
+          echo "Commit: ${GITHUB_SHA}"
+          echo "Deployed by: ${{ github.actor }}"
+
+      - name: Upload Deployment Artifacts
+        if: always() && steps.changed-files.outputs.has-changes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-artifacts-${{ github.ref_name }}-${{ github.run_number }}
+          path: |
+            package/
+            destructiveChanges/
+            coverage/
+
+      - name: Deployment Failure Notification
+        if: failure() && steps.changed-files.outputs.has-changes == 'true'
+        uses: slackapi/slack-github-action@v2.1.1
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: webhook-trigger
+          payload: |
+            Repository: "${{ github.repository }}"
+            Branch: "${{ github.ref_name }}"
+            Feature_Branch : "${{ steps.extract-branch.outputs.feature-branch }}"
+            Deployed_by : "${{ github.actor }}"
+            Commit : "<${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}|${{ github.sha }}>"
+            Workflow_Run: "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Logs>"
+
+      - name: No Changes Notification
+        if: steps.changed-files.outputs.has-changes == 'false'
+        run: |
+          echo "::notice::No Salesforce changes detected in this push. Deployment skipped."
